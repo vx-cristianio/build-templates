@@ -1,0 +1,252 @@
+parameters:
+- name: projectName
+  type: string
+  displayName: Target Project to update all referenced template refs
+
+- name: buildTemplateRepoName
+  type: string
+  default: $($env:BUILD_REPOSITORY_NAME)
+  displayName: Template git repository name
+
+- name: buildTemplateProjectName
+  type: string
+  default: $($env:SYSTEM_TEAMPROJECT)
+  displayName: Project containing the template repository
+
+- name: personalAccessToken
+  type: string
+  default: $(System.AccessToken)
+
+- name: dryRun
+  type: boolean
+  default: true
+
+- name: stepName
+  type: string
+  default: Update refs
+
+steps:
+    - task: PowerShell@2
+      displayName: ${{parameters.stepName}}
+      env:
+        AZDO_PERSONAL_ACCESS_TOKEN: ${{parameters.personalAccessToken}}
+      inputs:
+        failOnStderr: true
+        targetType: 'inline'
+        script: |
+          $contentType = "application/json"
+          $auth = "azdo" + ':' + $env:AZDO_PERSONAL_ACCESS_TOKEN
+          $Encoded = [System.Text.Encoding]::UTF8.GetBytes($auth)
+          $authorizationInfo = [System.Convert]::ToBase64String($Encoded)
+          $headers = @{"Authorization" = "Basic $($authorizationInfo)" }
+
+          function Get-Resources {
+          #gets existing template tag on a build pipeline by looking for resources matching the buildTemplate repository name
+              param (
+                  [Parameter(Mandatory = $true)][string]$projectName,
+                  [Parameter(Mandatory = $true)][string]$buildTemplateRepoID,
+                  [Parameter(Mandatory = $true)][string]$buildID 
+              )
+              write-Host "-------------------------"
+              write-Host "Searching for resource ID $buildTemplateRepoID in build pipeline $($_.Name) with ID $($_.id) in latest run"
+              $AdoGetUrl = "$(System.CollectionUri)$($projectName)/_apis/pipelines/$buildId/runs?api-version=7.0"
+
+              $buildsResourceList = Invoke-WebRequest -UseBasicParsing -Uri $AdoGetUrl -Method GET -Headers $headers -ContentType $contentType
+            
+              $latestRun = $($buildsResourceList.Content | ConvertFrom-Json |
+                  Select-Object -ExpandProperty Value |
+                  Where-Object { $_ -ne $null } |
+                  Sort-Object -Property id -Descending |
+                  Select-Object -First 1).id
+
+                  
+              $AdoGetUrl = "$(System.CollectionUri)$($projectName)/_apis/pipelines/$($buildId)?api-version=7.0"
+              $pipelineResult = $(Invoke-WebRequest -UseBasicParsing -Uri $AdoGetUrl -Method GET -Headers $headers -ContentType $contentType).content | ConvertFrom-Json
+              $yamlFile = $pipelineResult.configuration.path
+              $repoID = $pipelineResult.configuration.repository.id
+
+              $AdoGetUrl = "$(System.CollectionUri)$($projectName)/_apis/pipelines/$($buildId)/runs/$($latestRun)?api-version=7.0"
+              $runResult = $(Invoke-WebRequest -UseBasicParsing -Uri $AdoGetUrl -Method GET -Headers $headers -ContentType $contentType).content | ConvertFrom-Json
+
+              $currentRefs = ($runResult.resources.repositories | Get-Member -MemberType Properties | Where-Object { $_.Name -ne "self" } | ForEach-Object { $runResult.resources.repositories.$($_.Name) }) |
+                Where-Object { $_.repository.id -eq $buildTemplateRepoID } |
+                Select-Object -ExpandProperty refName
+              
+              if ($null -ne $currentRefs) { 
+              $match = [regex]::Match($currentRefs, '^refs\/tags\/(?<major>\d+)\.(?<minor>\d+)\.(?<build>\d+)$')
+              if($match.Success) {
+                  return @{
+                      Major = [int]::Parse($match.groups["major"].value)
+                      Minor = [int]::Parse($match.groups["minor"].value)
+                      Build = [int]::Parse($match.groups["build"].value)
+                      path  = $yamlFile
+                      repositoryId = $repoID
+                  }
+              }
+              else {
+                return $null
+              }
+              }
+              else {
+                  return $null
+              }  
+          }
+
+          function Get-Tags {
+          #gets highest tag for a specified major version in the template repository
+
+              param (
+                  [Parameter(Mandatory = $true)][string]$projectName,
+                  [Parameter(Mandatory = $true)][string]$repoName,
+                  [Parameter(Mandatory = $true)][string]$majorVer 
+              )
+              $RepoUrl = "$(System.CollectionUri)$($projectName)/_apis/git/repositories/$($repoName)/refs?api-version=7.1-preview.1"
+              $tagsResponse = Invoke-WebRequest -UseBasicParsing -Uri $repoUrl -Method GET -Headers $headers -ContentType $contentType
+              $latestTag = $tagsResponse.Content | ConvertFrom-Json | Select-Object -ExpandProperty Value | ForEach-Object { 
+                  $match = [regex]::Match($_.name, '^refs\/tags\/(?<major>\d+)\.(?<minor>\d+)\.(?<build>\d+)$')
+                  if($match.Success -and [int]$match.groups["major"].value -eq $majorVer) {
+                      return @{
+                          Major = [int]::Parse($match.groups["major"].value)
+                          Minor = [int]::Parse($match.groups["minor"].value)
+                          Build = [int]::Parse($match.groups["build"].value)
+                      }
+                  }
+                  else {
+                    return $null
+                  }
+                  
+                } | Sort-Object { $_.Minor }, { $_.Build } -Descending | Select-Object -First 1 
+              if($null -eq $latestTag) {
+                  echo "##vso[task.logissue type=warning]unable to get the latest tag version from the template repo on major version $majorVer."
+              }
+              else {return $latestTag}
+          }
+
+          function Update-BuildTemplateTag {
+          #Updates buildtemplate tag in child yaml file
+              param (
+                  [Parameter(Mandatory = $true)][string]$projectName,
+                  [Parameter(Mandatory = $true)][string]$repoID,
+                  [Parameter(Mandatory = $true)][string]$yamlFile,
+                  [Parameter(Mandatory = $true)][string]$buildTemplate,
+                  [Parameter(Mandatory = $true)][object]$newVersion
+              )
+              
+              $AdoGetFileURL = "$(System.CollectionUri)$($projectName)/_apis/git/repositories/$($repoId)/items?path=$($yamlFile)&api-version=7.0"
+              try {
+                  $RepoGetItemReq = Invoke-WebRequest -UseBasicParsing -Uri $AdoGetFileURL -Method GET -Headers $headers -ContentType $contentType
+              }
+              catch {
+                  $HTTPStatusCode = [int]$_.Exception.Response.StatusCode
+                  write-host $HTTPStatusCode
+                  if ($HTTPStatusCode -ne 200) {
+                      Write-Host "`t The yaml file does not exist in repo or the branch is not initialized."
+                      Exit 1
+                  }
+              }
+              if ($RepoGetItemReq.StatusCode -eq 200) {
+                  $ResponseContent = [System.Text.Encoding]::ASCII.GetString($RepoGetItemReq.Content)
+                  
+                  $pattern = "(name: $buildTemplate\s+ref: refs/tags/)(\d+\.\d+\.\d+)"
+                  $newFileContent = $ResponseContent -replace $pattern, "`${1}$newVersion"
+                  
+                  #get default branch
+                  $branchUrl = "$(System.CollectionUri)$($projectName)/_apis/git/repositories/$($repoId)/refs?api-version=7.1-preview.1&filter=heads/main"
+                
+                  $branchRequest = (Invoke-WebRequest -Uri $branchUrl -Method GET -Headers $headers -ContentType $contentType -UseBasicParsing)
+                  $mainBranch = (($branchRequest.content | ConvertFrom-Json).value) | Select-Object -First 1
+
+                  $hashchanges = @()
+                  $obj = New-Object -TypeName PSObject
+                  $filename = @{
+                                path = "$($yamlFile)"
+                              }
+                  $newcontent = @{
+                  content = $($newFileContent)
+                  contentType = "rawtext"
+                  }
+                  $obj | Add-Member -MemberType NoteProperty -Name changeType -Value "edit"
+                  $obj | Add-Member -MemberType NoteProperty -Name item -Value $filename
+                  $obj | Add-Member -MemberType NoteProperty -Name newcontent -Value $newcontent
+
+                  $hashchanges += $obj
+                  }
+                  
+                  if (($mainBranch.objectId).length -gt 0)
+                  {
+                    $oldcommit = $mainBranch.objectId
+                  } else {
+                    $oldcommit = "0000000000000000000000000000000000000000"
+                  }
+
+                  $body = @{
+                      refUpdates = @(
+                          @{
+                              name = "refs/heads/main"
+                              oldObjectId = $oldcommit
+                          }
+                      )
+                      commits = @(
+                          @{
+                              comment = "Update BuildTemplate version"
+                              changes = $hashchanges
+                          }
+                      )
+                  }
+
+                  $pushUrl = "$(System.CollectionUri)$($projectName)/_apis/git/repositories/$($repoId)/pushes?api-version=7.1-preview.2"
+                  $response = Invoke-WebRequest -Uri $pushUrl -Method POST -Headers $headers -Body (ConvertTo-Json $body -Depth 10) -ContentType $contentType
+                  if ($response.StatusCode -eq 201) {
+                  Write-Host "`t Successfully updated the build template tag." 
+                  }
+              }
+
+
+          #main
+
+          $projectName = "${{parameters.projectName}}"
+          $buildTemplateRepoName = "${{parameters.buildTemplateRepoName}}"
+          $buildTemplateProjectName = "${{parameters.buildTemplateProjectName}}"
+          $dryRun = "${{parameters.dryRun}}"
+
+          #find repository ID for build template repository
+          $repoUrl = "$(System.CollectionUri)$($buildTemplateProjectName)/_apis/git/repositories?api-version=7.1-preview.1"
+          if ($dryRun -eq $true) { write-host "This is a dry run. Showing only planned changes." }
+          write-host "Searching pipelines in project $projectName."
+          $reposResponse = Invoke-WebRequest -UseBasicParsing -Uri $repoUrl -Method GET -Headers $headers -ContentType $contentType
+          $buildTemplateRepoID = $reposResponse.content | ConvertFrom-Json | Select-Object -ExpandProperty value |  Where-Object { $_.name -eq $buildTemplateRepoName } | Select-Object -ExpandProperty id
+
+          if ($null -eq $buildTemplateRepoID) {
+              echo "##vso[task.logissue type=error]Could not find template repository ID with name $buildTemplateRepoName "
+              Exit 1
+          }
+
+          $AdoGetUrl = "$(System.CollectionUri)$($projectName)/_apis/pipelines?api-version=7.0"
+          $buildsResultList = Invoke-WebRequest -UseBasicParsing -Uri $AdoGetUrl -Method GET -Headers $headers -ContentType $contentType
+
+          $buildList = $buildsResultList.content | ConvertFrom-Json | Select-Object -ExpandProperty value | ForEach-Object {
+              $childPipeline= $(Get-Resources -projectName $projectName -buildTemplateRepoID $buildTemplateRepoID -buildID $_.id)
+              
+              if ($null -ne $childPipeline) {
+                  $buildTemplateTag = $(Get-Tags -projectName $buildTemplateProjectName -repoName $buildTemplateRepoName -majorVer $childPipeline.major)
+                  if ($null -ne $buildTemplateTag) {
+                    $oldVer = "$($childPipeline.Major).$($childPipeline.Minor).$($childPipeline.Build)"
+                    $newVer = "$($buildTemplateTag.Major).$($buildTemplateTag.Minor).$($buildTemplateTag.Build)"
+                    if ($oldVer -ne $newVer) {
+                    
+                    if ($dryRun -eq $false) {
+                      Write-Host "Found referenced tag version: $oldVer.  Updating to $newVer"
+                      Update-BuildTemplateTag -projectName $projectName -repoID $childPipeline.repositoryId -yamlFile $childPipeline.path -buildTemplate "$($buildTemplateProjectName)/$($buildTemplateRepoName)" -newVersion $newVer
+                      }
+                      else {
+                        Write-Host "Found referenced tag version: $oldVer.  Update is needed to $newVer"
+                      } 
+                    }
+                    else {
+                      Write-Host "Referenced tag already at latest version $newVer"
+                    }
+                  }
+              } else {
+                  Write-Host "No reference to build template found in pipeline."
+              }
+          }

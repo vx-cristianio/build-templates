@@ -1,0 +1,57 @@
+#Update references to a build template based on refs in a child pipeline
+
+trigger: none
+
+parameters:
+  - name: projectName
+    displayName: Target project Name to update template refs
+    type: string
+  - name: dryRun
+    displayName: Apply changes?
+    type: boolean
+    default: false
+
+variables:
+  - group: Azure Devops Automation    
+  - name: defaultBranchName
+    value: refs/heads/main
+
+stages:
+  - stage: Plan_changes
+    displayName: Plan changes
+    jobs:
+    - job: plan
+      displayName: Plan Update Tags  
+      steps:
+      - checkout: self
+      - template: utilities/updateBuildTemplateRefs.yaml
+        parameters:
+          projectName: ${{ parameters.projectName }}
+          personalAccessToken: $(pat)
+          dryRun: True
+          stepName: Dry run update refs
+
+  - ${{ if and(or(eq('True', parameters.dryRun), ne(variables['Build.Reason'], 'Manual')), eq(variables.defaultBranchName, variables['Build.SourceBranch'])) }}: 
+    - stage: Apply_changes
+      displayName: Apply changes
+      dependsOn: Plan_changes
+      condition: eq(dependencies.Plan_changes.result,'Succeeded')
+      jobs:
+        - deployment: Apply    
+          displayName: Apply Update Tags
+          environment: production
+          timeoutInMinutes: 0
+          strategy:
+            runOnce:
+              deploy:
+                steps:
+                - checkout: self
+                - template: utilities/updateBuildTemplateRefs.yaml
+                  parameters:
+                    projectName: ${{ parameters.projectName }}
+                    personalAccessToken: $(pat)
+                    dryRun: false
+                    stepName: Apply update refs
+
+
+            
