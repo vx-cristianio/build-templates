@@ -188,7 +188,7 @@ steps:
                       )
                       commits = @(
                           @{
-                              comment = "Update BuildTemplate version"
+                              comment = "Update BuildTemplate version [skip ci]"
                               changes = $hashchanges
                           }
                       )
